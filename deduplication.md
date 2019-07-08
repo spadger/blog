@@ -1,5 +1,5 @@
-# Upgrading Kafka Streams from exactly-once delivery to exactly-once processing
-A well-tuned, multi-broker Kafka cluster is resilient to hardware errors, generally stable and blazingly fast.  It also boasts of an “exactly-once” delivery mode, which does work as described, albeit in a very specific scenario.   
+# Evolving Kafka Streams from exactly-once delivery to exactly-once processing - tales form the trenches
+A well-tuned, multi-broker Kafka cluster is resilient to hardware errors, generally stable and blazingly fast.  It also boasts of an “exactly-once” delivery mode (dubbed EOS - Exactly-Once Semantics), which does work as [described](https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/), albeit in a very specific scenario.   
 
 For these reasons, we have put Kafka at the heart of our technology stack when building our new bank, but banking software comes with a whole load of trust, ethical and regulatory issues that do not necessarily exist in other environments. If an analytics platform fails to record a page view, nobody will panic; if a dinner reservation goes missing, someone may be grumpy, but ultimately, they'll be OK.  If a bank loses a payment for a £300,000 house, or if it processes the payment twice (a much more likely scenario, as we’ll see), a lot of people are going to have a bad day. 
 
@@ -17,7 +17,7 @@ For the purposes of demonstration, let’s assume a simple Kafka Streams topolog
 
 We will use this simplified topology as our starting point, and build it up until it is fit for purpose.
 
-## Failure mode 1 – loss of offsets 
+## Lets start failing – loss of offsets 
 Although Kafka Streams supports exactly-once semantics, this applies to messages in-flight, and works by coordinating the upstream producer and the broker on one side of the topology, and coordinating the topology’s producer & offset recorder with broker at the rear end.  This is great for handling application crashes or network glitches, but a common occurrence with Kafka is offset loss.  This could happen due to a technical error, or simply by not receiving a message in the last 7 days, but it is a relatively common Kafka failure mode.
 
 ---
@@ -25,14 +25,12 @@ Although Kafka Streams supports exactly-once semantics, this applies to messages
 
 ---
 
-To protect against offset loss, we can add a deduplicator processor to filter out messages we have already processed.  Our first attempt doesn’t need to be complex – choose a deduplication key for each message.  It should be unique for a specific massage, e.g. in our case, a combination of transaction id and transaction type could suffice, so long as our upstream message sources are aware of the policy (it’s a lot more complicated than this in real life, as always). 
-
- 
+To protect against offset loss, we can add a deduplicator processor to filter out messages we have already processed.  Our first attempt doesn’t need to be complex – choose a deduplication key for each message.  It should be unique for a specific message, e.g. in this case, a combination of transaction id and transaction type could suffice, so long as our upstream message sources are aware of the policy and implement it (it’s a lot more complicated than this in real life, as always). 
 
 We can implement the deduplicator using a Kafka Streams [windowed state store](https://docs.confluent.io/current/streams/developer-guide/processor-api.html#defining-and-creating-a-state-store).  Remember, when choosing the window duration, you need to balance protection offered vs node rebalancing time in the event of a new instance coming online; if you need to rehydrate 10bn records into a state store, your entire application will stop processing for quite a while, even nodes that have been happily processing whilst the application rebalances
 
 ---
-*These code samples shouldn’t be copied; they are the absolute minimum skeleton needed to explain the idea.  They lack logging, metrics, structure and subtlety required of production software*
+*Perennial note: These code samples shouldn’t be copied; they are the absolute minimum skeleton needed to explain the idea.  They lack logging, metrics, structure and subtlety required of production software*
 
 ---
 
@@ -78,8 +76,8 @@ This general pattern has served us well for simple deduplication / offset-loss p
 
  ![staleness-check](./content/4-staleness-check.png "At this point we are rejecting messages older than our deduplicaiton guarantee")
  
- ## Failure mode 2 – Loss of deduplication topics 
- Sometimes, things go horribly wrong, which may lead to the loss of a topic.  It could be an unfortunate terraform config, a Kafka bug, or even malice, but ultimately, if your application’s correctness is important enough, you need to protect against it.  In this example, we are going to protect against one of the simpler problems – loss of the deduplication store’s changelog topic.  When our streams node starts, the first thing it will do is rehydrate its RocksDB online state store from the changelog.  If we can’t, our current deduplication strategy is dead in the water.  At this point, we need to diversify from the Kafka ecosystem to spread our risk.  Let’s take a slightly different look at our happy path, with just the salient stages
+ ## Lets fail harder – Loss of deduplication topics 
+ Sometimes, things go horribly wrong, which may lead to the loss of a topic.  It could be an unfortunate terraform config, a Kafka bug, or even malice, but ultimately, if your application’s correctness is important enough, you need to protect against it.  In this example, we are going to protect against one of the simpler problems – loss of the deduplication store’s changelog topic.  When our streams node starts, the first thing it will do is rehydrate its RocksDB online state store from the changelog.  If we can’t, our current deduplication strategy is dead in the water.  At this point, we need to diversify from the Kafka ecosystem to mitigate the risk.  Let’s take a slightly higher-level look at our happy path, with just the important stages
  
 ![high-level](./content/5-high-level.png "A high-level view of our deduplication happy-path")
 
@@ -97,9 +95,9 @@ The answers to these questions revolve around the fact that the two stores fulfi
 ---
 *A note on clearing deduplication ids from Redis*
 
-*If you implement a Redis-bases deduplicator, do not be tempted to set a key expiration date when adding keys.  Redis deletes keys with TTLs by randomly sampling 20 keys in a set every 100ms, deleting any that have expired.  If more than 25% are expired, it will run another sweep.  [Check here](https://redis.io/commands/expire#how-redis-expires-keys) for more info. Importantly, this process is non-deterministic, and may not be able to cope with the volume of new keys being introduced into the system.  I recommend double-writing into rotating, overlapping sets, and deterministically removing those periodically.* 
+*If you implement a Redis-bases deduplicator, do not be tempted to set a key expiration date when adding keys.  If you want to know more, check out [this](https://redis.io/commands/expire#how-redis-expires-keys). Importantly, this process is non-deterministic, and may not be able to cope with the volume of new keys being introduced into the system. There are set-based ways to achieve high-performance key expiration, which is left as an excercise for the reader* 
 
 ---
 
 ## Rounding up
-Kafka Streams comes with may useful features out of the box, but where exactly-once processing at a business level is important, they are really only building blocks.  This blog post has covered some major components of a “hopefully, pretty much once” processing scheme, but there are more aspects to consider to end up with a truly safe system.  Ultimately, it relies on a huge modelling effort of your specific topology and domain, to come up with a list of failure modes, and their respective likelihood and importance.  I hope this article has opened your eyes to some of the complexity of building reliable distributed systems, and show you that distributed failures need to be treated with respect, because dealing with these issues at 3am would not be much fun at all 
+Kafka Streams comes with may useful features out of the box, but fir situations where exactly-once processing at a business level is important, they are really only building blocks.  This blog post has covered some major components of a “hopefully, pretty much once” processing scheme, but there are more aspects to consider to end up with a truly safe system.  Ultimately, it relies on a huge modelling effort of your specific topology and domain, to come up with a list of failure modes, and their respective likelihood and importance.  I hope this article has opened your eyes to some of the complexity of building reliable distributed systems, and show you that distributed failures need to be treated with respect, because dealing with these issues at 3am would not be much fun at all 
